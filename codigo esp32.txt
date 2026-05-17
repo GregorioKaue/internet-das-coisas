@@ -1,0 +1,273 @@
+/* ================================================================
+   ESP32 — CONTROLE DE LED VIA MQTT
+   Integração com App Android (React Native + paho-mqtt)
+
+   AUTOR: Projeto IoT ESP32 Controller
+   VERSÃO: 2.0
+
+   DESCRIÇÃO:
+   O ESP32 conecta-se à rede Wi-Fi, acessa o broker MQTT público
+   e aguarda comandos enviados pelo aplicativo Android.
+   Ao receber "LIGAR", acende o LED. Ao receber "DESLIGAR",
+   apaga o LED. Publica confirmação de volta ao aplicativo.
+
+   TÓPICOS MQTT:
+     Subscrição  →  esp32/controle   (recebe comandos do App)
+     Publicação  →  esp32/status     (envia confirmações ao App)
+
+   CONEXÕES FÍSICAS:
+   ┌──────────────────────────────────────────────────────────┐
+   │  COMPONENTE          ESP32 PIN    OBSERVAÇÃO             │
+   │  LED externo (+)  →  GPIO 2       Anodo via resistor     │
+   │  Resistor 330Ω    →  em série     Limita corrente        │
+   │  LED externo (-)  →  GND          Catodo ao negativo     │
+   │  LED onboard      →  GPIO 2       LED azul já embutido   │
+   └──────────────────────────────────────────────────────────┘
+
+   BIBLIOTECAS NECESSÁRIAS (Arduino IDE):
+     • PubSubClient  — Nick O'Leary  (Gerenciador de Bibliotecas)
+     • WiFi.h        — Embutida no core ESP32 (não instalar)
+   ================================================================ */
+
+#include <WiFi.h>
+#include <PubSubClient.h>
+
+
+/* ================================================================
+   CONFIGURAÇÕES — EDITE AQUI ANTES DE ENVIAR AO ESP32
+   ================================================================ */
+
+// ── Rede Wi-Fi ────────────────────────────────────────────────
+// O ESP32 e o smartphone devem estar na MESMA rede Wi-Fi
+// (ou o smartphone pode usar dados móveis, pois o broker é público)
+const char* SSID     = "Wokwi-GUEST";     // <-- troque pelo nome da sua rede
+const char* PASSWORD = "";   // <-- troque pela senha da sua rede
+
+// ── Broker MQTT ───────────────────────────────────────────────
+// Mesmo endereço configurado no App.js (MQTT_CONFIG.host)
+// Porta 1883 = TCP padrão MQTT (ESP32 usa TCP; App usa WebSocket 8000)
+// Ambos se comunicam pelo mesmo broker sem conflito de porta
+const char* MQTT_SERVER = "broker.hivemq.com";
+const int   MQTT_PORT   = 1883;
+const char* CLIENT_ID   = "esp32_led_ctrl_01"; // ID único no broker
+
+// ── Tópicos MQTT — devem ser IDÊNTICOS aos do App.js ─────────
+const char* TOPIC_RECEBE = "esp32/controle";  // App publica → ESP32 lê
+const char* TOPIC_ENVIA  = "esp32/status";    // ESP32 publica → App lê
+
+// ── Pinos do LED ──────────────────────────────────────────────
+// GPIO 2  = LED onboard (azul) soldado na placa ESP32 DevKit
+//           Não precisa de resistor externo — já está na placa
+// Para LED EXTERNO: use o mesmo GPIO 2 com resistor de 330Ω em série
+#define PINO_LED 2
+
+
+/* ================================================================
+   OBJETOS GLOBAIS
+   ================================================================ */
+WiFiClient   espClient;               // Cliente TCP para o Wi-Fi
+PubSubClient mqttClient(espClient);   // Cliente MQTT sobre TCP
+
+// Variável que guarda o estado atual do LED
+bool ledLigado = false;
+
+
+/* ================================================================
+   CALLBACK MQTT
+   Chamada automaticamente toda vez que o ESP32 recebe
+   uma mensagem no tópico "esp32/controle"
+   ================================================================ */
+void callback(char* topic, byte* payload, unsigned int length)
+{
+  // ── Monta a string da mensagem recebida ──────────────────────
+  String mensagem = "";
+  for (unsigned int i = 0; i < length; i++) {
+    mensagem += (char)payload[i];
+  }
+
+  // ── Log no monitor serial ─────────────────────────────────────
+  Serial.println("──────────────────────────────────");
+  Serial.print("[MQTT IN] Tópico : ");
+  Serial.println(topic);
+  Serial.print("[MQTT IN] Payload: ");
+  Serial.println(mensagem);
+
+  // ── Processa o comando ────────────────────────────────────────
+  if (mensagem == "LIGAR")
+  {
+    // Liga o LED
+    digitalWrite(PINO_LED, HIGH);
+    ledLigado = true;
+
+    // Confirma ao App — essa mensagem aparece no campo "Resposta da ESP32"
+    mqttClient.publish(TOPIC_ENVIA, "✔ LED LIGADO — GPIO 2 em HIGH");
+
+    Serial.println("[LED] Estado: LIGADO (GPIO 2 = HIGH)");
+  }
+  else if (mensagem == "DESLIGAR")
+  {
+    // Desliga o LED
+    digitalWrite(PINO_LED, LOW);
+    ledLigado = false;
+
+    // Confirma ao App
+    mqttClient.publish(TOPIC_ENVIA, "✔ LED DESLIGADO — GPIO 2 em LOW");
+
+    Serial.println("[LED] Estado: DESLIGADO (GPIO 2 = LOW)");
+  }
+  else
+  {
+    // Comando desconhecido — informa o App
+    String resposta = "⚠ Comando desconhecido: [" + mensagem + "]";
+    mqttClient.publish(TOPIC_ENVIA, resposta.c_str());
+
+    Serial.println("[ERRO] Comando nao reconhecido: " + mensagem);
+  }
+
+  Serial.println("──────────────────────────────────");
+}
+
+
+/* ================================================================
+   CONEXÃO WI-FI
+   Aguarda até obter endereço IP. Pisca o LED onboard
+   durante a tentativa de conexão como feedback visual.
+   ================================================================ */
+void conectarWiFi()
+{
+  Serial.println("\n[WiFi] Iniciando conexao...");
+  Serial.print("[WiFi] SSID: ");
+  Serial.println(SSID);
+
+  WiFi.mode(WIFI_STA);         // Modo estação (cliente)
+  WiFi.begin(SSID, PASSWORD);
+
+  int tentativas = 0;
+  while (WiFi.status() != WL_CONNECTED)
+  {
+    // Pisca o LED a cada 500 ms enquanto conecta
+    digitalWrite(PINO_LED, !digitalRead(PINO_LED));
+    delay(500);
+    Serial.print(".");
+    tentativas++;
+
+    // Após 40 tentativas (~20s) reinicia o ESP32
+    if (tentativas > 40) {
+      Serial.println("\n[WiFi] Falha persistente. Reiniciando ESP32...");
+      ESP.restart();
+    }
+  }
+
+  // Garante que o LED começa apagado após a conexão
+  digitalWrite(PINO_LED, LOW);
+
+  Serial.println("\n[WiFi] Conectado com sucesso!");
+  Serial.print("[WiFi] Endereço IP local : ");
+  Serial.println(WiFi.localIP());
+  Serial.print("[WiFi] Força do sinal    : ");
+  Serial.print(WiFi.RSSI());
+  Serial.println(" dBm");
+}
+
+
+/* ================================================================
+   RECONEXÃO MQTT
+   Chamada no loop() sempre que a conexão com o broker cair.
+   Tenta reconectar indefinidamente com intervalo de 5 segundos.
+   ================================================================ */
+void reconectarMQTT()
+{
+  while (!mqttClient.connected())
+  {
+    Serial.print("[MQTT] Tentando conectar ao broker ");
+    Serial.print(MQTT_SERVER);
+    Serial.print(":");
+    Serial.println(MQTT_PORT);
+
+    // Tenta conectar com Client ID único
+    if (mqttClient.connect(CLIENT_ID))
+    {
+      Serial.println("[MQTT] Conectado ao broker!");
+
+      // ── Subscreve no tópico de comandos ──────────────────────
+      // QoS 0 = entrega sem garantia (suficiente para controle local)
+      mqttClient.subscribe(TOPIC_RECEBE);
+      Serial.print("[MQTT] Subscrito em: ");
+      Serial.println(TOPIC_RECEBE);
+
+      // ── Publica mensagem de presença ──────────────────────────
+      // Essa mensagem aparece no App assim que o ESP32 fica online
+      String msgOnline = "ESP32 online! IP: " + WiFi.localIP().toString();
+      mqttClient.publish(TOPIC_ENVIA, msgOnline.c_str());
+
+      Serial.print("[MQTT] Publicando presença em: ");
+      Serial.println(TOPIC_ENVIA);
+    }
+    else
+    {
+      Serial.print("[MQTT] Falha. Código de erro: ");
+      Serial.print(mqttClient.state());
+      // Códigos: -4=timeout, -3=conexão recusada, -2=unavailable,
+      //          -1=protocolo, 1=bad_proto, 2=bad_id, 3=unavailable,
+      //          4=bad_credentials, 5=unauthorized
+      Serial.println(" | Nova tentativa em 5s...");
+      delay(5000);
+    }
+  }
+}
+
+
+/* ================================================================
+   SETUP — Executado uma vez ao ligar o ESP32
+   ================================================================ */
+void setup()
+{
+  Serial.begin(115200);
+  delay(200);
+
+  Serial.println("\n╔══════════════════════════════════╗");
+  Serial.println("║   ESP32 LED CONTROLLER via MQTT  ║");
+  Serial.println("╚══════════════════════════════════╝");
+
+  // Configura o pino do LED como saída e garante estado inicial LOW
+  pinMode(PINO_LED, OUTPUT);
+  digitalWrite(PINO_LED, LOW);
+
+  // Conecta ao Wi-Fi
+  conectarWiFi();
+
+  // Configura o cliente MQTT com endereço do broker e callback
+  mqttClient.setServer(MQTT_SERVER, MQTT_PORT);
+  mqttClient.setCallback(callback);
+  mqttClient.setKeepAlive(30);    // Heartbeat a cada 30s
+  mqttClient.setSocketTimeout(10); // Timeout de 10s por operação
+
+  // Primeira conexão ao broker
+  reconectarMQTT();
+
+  Serial.println("\n[SISTEMA] Pronto! Aguardando comandos do App...");
+  Serial.println("[SISTEMA] Tópico de entrada : " + String(TOPIC_RECEBE));
+  Serial.println("[SISTEMA] Tópico de saída   : " + String(TOPIC_ENVIA));
+}
+
+
+/* ================================================================
+   LOOP — Executado continuamente após o setup()
+   ================================================================ */
+void loop()
+{
+  // Verifica e restaura conexão MQTT se necessário
+  if (!mqttClient.connected()) {
+    reconectarMQTT();
+  }
+
+  // Processa mensagens MQTT recebidas e mantém a conexão viva
+  // IMPORTANTE: sempre chame mqttClient.loop() no loop principal
+  mqttClient.loop();
+
+  // Verifica se o Wi-Fi caiu e reconecta
+  if (WiFi.status() != WL_CONNECTED) {
+    Serial.println("[WiFi] Conexão perdida! Reconectando...");
+    conectarWiFi();
+  }
+}
